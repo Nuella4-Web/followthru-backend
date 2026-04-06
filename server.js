@@ -3,87 +3,92 @@ const cors = require('cors');
 const fetch = require('node-fetch');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-site.netlify.app';
-
-// ─── Middleware ────────────────────────────────────────────
-app.use(cors({
-  origin: FRONTEND_URL,
-  credentials: true
-}));
+app.use(cors());
 app.use(express.json());
 
-// ─── Health Check ─────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'FollowThru backend is running' });
+const CLIENT_ID = process.env.JIRA_CLIENT_ID;
+const CLIENT_SECRET = process.env.JIRA_CLIENT_SECRET;
+const REDIRECT_URI = 'https://weekly-pulse.onrender.com/callback';
+
+// Step 1: Redirect user to Jira login
+app.get('/auth', (req, res) => {
+  const authUrl = `https://auth.atlassian.com/authorize?audience=api.atlassian.com&client_id=${CLIENT_ID}&scope=read%3Ajira-work%20read%3Ajira-user&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&prompt=consent`;
+  res.redirect(authUrl);
 });
 
-// ─── Extract Action Items ──────────────────────────────────
-app.post('/extract', async (req, res) => {
-  const { notes } = req.body;
-
-  if (!notes || !notes.trim()) {
-    return res.status(400).json({ error: 'No meeting notes provided' });
-  }
+// Step 2: Handle callback from Jira, exchange code for token
+app.get('/callback', async (req, res) => {
+  const { code } = req.query;
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const tokenRes = await fetch('https://auth.atlassian.com/oauth/token', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'claude-opus-4-5',
-        max_tokens: 1000,
-        system: `Extract ALL action items from meeting notes. Return ONLY valid JSON — no markdown fences, no explanation, nothing else.
-Format exactly:
-{
-  "items": [
-    {
-      "id": "1",
-      "action": "Clear description of what needs to be done",
-      "owner": "Person name or 'Team'",
-      "deadline": "Specific date or timeframe, or null",
-      "priority": "High|Medium|Low"
-    }
-  ]
-}
-Rules: extract every task/follow-up; infer priority (urgent/ASAP = High, default = Medium, when-you-get-a-chance = Low); use first or full name as written; if whole team, use "Team".`,
-        messages: [
-          {
-            role: 'user',
-            content: `Extract action items from these meeting notes:\n\n${notes}`
-          }
-        ]
+        grant_type: 'authorization_code',
+        client_id: CLIENT_ID,
+        client_secret: CLIENT_SECRET,
+        code,
+        redirect_uri: REDIRECT_URI
       })
     });
 
-    const data = await response.json();
+    const tokenData = await tokenRes.json();
+    const accessToken = tokenData.access_token;
 
-    if (data.error) {
-      console.error('Anthropic API error:', data.error);
-      return res.status(500).json({ error: 'AI extraction failed', details: data.error.message });
-    }
-
-    const raw = data.content?.[0]?.text || '{}';
-    const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
-    const items = (parsed.items || []).map((item, i) => ({
-      ...item,
-      id: String(i + 1)
-    }));
-
-    res.json({ items });
+    // Redirect to frontend with token
+    res.redirect(`https://weekly-pulse.netlify.app?token=${accessToken}`);
   } catch (err) {
-    console.error('Extract error:', err);
-    res.status(500).json({ error: 'Extraction failed', details: err.message });
+    res.status(500).json({ error: 'OAuth failed', details: err.message });
   }
 });
 
-// ─── Start Server ──────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`FollowThru backend running on port ${PORT}`);
-  console.log(`Accepting requests from: ${FRONTEND_URL}`);
+// Step 3: Fetch Jira issues using the token
+app.get('/jira/issues', async (req, res) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+
+  try {
+    // Get accessible Jira sites
+    const sitesRes = await fetch('https://api.atlassian.com/oauth/token/accessible-resources', {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
+    });
+    const sites = await sitesRes.json();
+    const cloudId = sites[0].id;
+
+    // Fetch issues from all statuses
+    const issuesRes = await fetch(
+      `https://api.atlassian.com/ex/jira/${cloudId}/rest/api/3/search?jql=project IS NOT EMPTY ORDER BY updated DESC&maxResults=50&fields=summary,status,assignee,description,priority`,
+      { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }
+    );
+
+    const issuesData = await issuesRes.json();
+    const issues = issuesData.issues || [];
+
+    // Categorise issues by status
+    const done = issues.filter(i => i.fields.status.name.toLowerCase() === 'done');
+    const inProgress = issues.filter(i => i.fields.status.name.toLowerCase() === 'in progress');
+    const toDo = issues.filter(i => i.fields.status.name.toLowerCase() === 'to do');
+    const blocked = issues.filter(i => {
+      const desc = i.fields.description?.content?.[0]?.content?.[0]?.text || '';
+      return desc.toLowerCase().includes('blocked');
+    });
+
+    res.json({
+      done: done.map(i => i.fields.summary),
+      inProgress: inProgress.map(i => i.fields.summary),
+      toDo: toDo.map(i => i.fields.summary),
+      blocked: blocked.map(i => i.fields.summary),
+      total: issues.length
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch issues', details: err.message });
+  }
 });
+
+// Health check
+app.get('/', (req, res) => res.json({ status: 'Weekly Pulse backend running' }));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

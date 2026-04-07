@@ -10,11 +10,12 @@ app.use(cors({
   credentials: true
 }));
 
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '15mb' }));
 
 app.get('/', (req, res) => {
   res.json({ status: 'FollowThru backend is running' });
 });
+
 
 // ─── Extract Action Items ──────────────────────────────────
 app.post('/extract', async (req, res) => {
@@ -35,32 +36,24 @@ app.post('/extract', async (req, res) => {
       body: JSON.stringify({
         model: 'claude-opus-4-5',
         max_tokens: 2000,
-        system: `You are a precise meeting notes parser. Your job is to extract every single action item from meeting notes without missing any or merging any together.
+        system: `You are a precise meeting notes parser. Extract every single action item from meeting notes without missing any or merging any together.
 
-STRICT RULES — follow every one of these without exception:
+STRICT RULES:
+1. Extract EVERY action item. If in doubt, include it.
+2. NEVER merge two separate tasks into one item.
+3. NEVER skip a task because it seems vague. Mark owner as Team if no person is named.
+4. Keep the action description close to the original wording.
+5. OWNER: Use the person name exactly as written. Multiple owners: Name1 and Name2. No name: Team.
+6. DEADLINE: Extract exact date or timeframe. If none, use null.
+7. PRIORITY: urgent/ASAP/critical = High. Default = Medium. when you get a chance = Low.
+8. Return ONLY valid JSON. No markdown. Nothing else.
 
-1. EXTRACT EVERY action item. An action item is any sentence or phrase where a person or group is expected to do something. If in doubt, include it.
-
-2. NEVER merge two separate tasks into one item. If two things are mentioned they become two separate items even if they involve the same person.
-
-3. NEVER skip an action item because it seems vague. Extract it as written and mark the owner as Team if no specific person is named.
-
-4. KEEP the action description close to the original wording. Do not rewrite or summarise. Just clean up grammar slightly if needed.
-
-5. OWNER: Use the person name exactly as written in the notes. If multiple people own a task list them as Name1 and Name2. If no name is given use Team.
-
-6. DEADLINE: Extract the exact date or timeframe mentioned. Examples: by Friday, end of April, April 11, this week, next Monday. If no deadline is mentioned use null.
-
-7. PRIORITY: Use High if the notes say urgent, high priority, ASAP, or critical. Use Low if the notes say when you get a chance or low priority. Default to Medium for everything else.
-
-8. Return ONLY valid JSON. No markdown, no explanation, nothing else before or after the JSON.
-
-Output format:
+Format:
 {
   "items": [
     {
       "id": "1",
-      "action": "Exact description of the task",
+      "action": "Task description",
       "owner": "Person name or Team",
       "deadline": "Timeframe or null",
       "priority": "High|Medium|Low"
@@ -70,25 +63,18 @@ Output format:
         messages: [
           {
             role: 'user',
-            content: `Extract every action item from these meeting notes. Do not miss any. Do not merge any.\n\n${notes}`
+            content: `Extract every action item. Do not miss any. Do not merge any.\n\n${notes}`
           }
         ]
       })
     });
 
     const data = await response.json();
-
-    if (data.error) {
-      console.error('Anthropic error:', data.error);
-      return res.status(500).json({ error: data.error.message });
-    }
+    if (data.error) return res.status(500).json({ error: data.error.message });
 
     const raw = data.content?.[0]?.text || '{}';
     const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
-    const items = (parsed.items || []).map((item, i) => ({
-      ...item,
-      id: String(i + 1)
-    }));
+    const items = (parsed.items || []).map((item, i) => ({ ...item, id: String(i + 1) }));
 
     console.log(`Extracted ${items.length} items`);
     res.json({ items });
@@ -99,19 +85,21 @@ Output format:
   }
 });
 
-// ─── Match Tracker Screenshot ──────────────────────────────
-// Reads a screenshot of an existing tracker, identifies columns,
-// then maps action items to those exact columns and returns a CSV
-app.post('/match-tracker', async (req, res) => {
-  const { imageBase64, imageType, items } = req.body;
 
-  if (!imageBase64 || !items || !items.length) {
-    return res.status(400).json({ error: 'Image and items are required' });
+// ─── Combine Tracker ───────────────────────────────────────
+// Reads existing tracker screenshot, combines with new items,
+// returns CSV in either standard format or matched column format
+app.post('/combine-tracker', async (req, res) => {
+  const { imageBase64, imageType, newItems, format } = req.body;
+  // format: 'standard' or 'match'
+
+  if (!imageBase64 || !newItems || !newItems.length) {
+    return res.status(400).json({ error: 'Screenshot and new items are required' });
   }
 
   try {
-    // Step 1: Read the tracker screenshot and identify columns
-    const visionResponse = await fetch('https://api.anthropic.com/v1/messages', {
+    // Step 1: Read the tracker screenshot — get columns AND existing rows
+    const readResponse = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -120,21 +108,37 @@ app.post('/match-tracker', async (req, res) => {
       },
       body: JSON.stringify({
         model: 'claude-opus-4-5',
-        max_tokens: 500,
-        system: `You are reading a screenshot of a task tracker spreadsheet. Your job is to identify the column headers exactly as they appear.
+        max_tokens: 3000,
+        system: `You are reading a screenshot of a task tracker spreadsheet.
+Extract the column headers AND all visible rows of data.
 
-Return ONLY valid JSON with no markdown, no explanation.
+Return ONLY valid JSON. No markdown. No explanation.
 
 Format:
 {
   "columns": ["Column1", "Column2", "Column3"],
-  "taskColumn": "The column name that holds the task or action description",
-  "ownerColumn": "The column name that holds the person responsible or null if none",
-  "statusColumn": "The column name that holds the status or null if none",
-  "dateColumn": "The column name that holds the date or deadline or null if none",
-  "deliverableColumn": "The column name that holds deliverable or null if none",
-  "priorityColumn": "The column name that holds priority or null if none"
-}`,
+  "rows": [
+    ["row1col1 value", "row1col2 value", "row1col3 value"],
+    ["row2col1 value", "row2col2 value", "row2col3 value"]
+  ],
+  "taskColumnIndex": 0,
+  "ownerColumnIndex": 1,
+  "statusColumnIndex": 2,
+  "dateColumnIndex": 3,
+  "deliverableColumnIndex": -1,
+  "priorityColumnIndex": -1
+}
+
+Rules:
+- columns: exact header names as they appear
+- rows: all visible data rows (not the header row), each row is an array matching the column order
+- taskColumnIndex: index of the column that holds the task or action description
+- ownerColumnIndex: index of the column with the owner or person responsible, -1 if not found
+- statusColumnIndex: index of the column with status, -1 if not found
+- dateColumnIndex: index of the column with date or deadline, -1 if not found
+- deliverableColumnIndex: index of the deliverable column, -1 if not found
+- priorityColumnIndex: index of the priority column, -1 if not found
+- If a column is not present set its index to -1`,
         messages: [
           {
             role: 'user',
@@ -149,7 +153,7 @@ Format:
               },
               {
                 type: 'text',
-                text: 'What are the column headers in this tracker? Return the JSON as instructed.'
+                text: 'Read this tracker screenshot. Return the columns and all visible data rows as JSON.'
               }
             ]
           }
@@ -157,66 +161,99 @@ Format:
       })
     });
 
-    const visionData = await visionResponse.json();
+    const readData = await readResponse.json();
+    if (readData.error) return res.status(500).json({ error: 'Could not read tracker screenshot' });
 
-    if (visionData.error) {
-      console.error('Vision error:', visionData.error);
-      return res.status(500).json({ error: 'Could not read tracker screenshot' });
+    const rawRead = readData.content?.[0]?.text || '{}';
+    const tracker = JSON.parse(rawRead.replace(/```json|```/g, '').trim());
+
+    const { columns, rows, taskColumnIndex, ownerColumnIndex, statusColumnIndex, dateColumnIndex, deliverableColumnIndex, priorityColumnIndex } = tracker;
+
+    if (!columns || !columns.length) {
+      return res.status(400).json({ error: 'Could not detect columns. Try a clearer screenshot showing the full header row.' });
     }
 
-    const visionRaw = visionData.content?.[0]?.text || '{}';
-    const trackerSchema = JSON.parse(visionRaw.replace(/```json|```/g, '').trim());
+    console.log('Detected columns:', columns);
+    console.log('Existing rows:', rows ? rows.length : 0);
 
-    console.log('Detected columns:', trackerSchema.columns);
+    let csv = '';
 
-    // Step 2: Build CSV using their exact columns
-    const columns = trackerSchema.columns || [];
+    if (format === 'match') {
+      // ── Option B: Keep their exact columns ──
+      // Header row
+      const headerRow = columns.map(c => `"${c.replace(/"/g, '""')}"`).join(',');
 
-    if (!columns.length) {
-      return res.status(400).json({ error: 'Could not detect columns from screenshot. Try a clearer image.' });
+      // Existing rows (already in their format)
+      const existingRows = (rows || []).map(row => {
+        return columns.map((_, i) => {
+          const val = row[i] || '';
+          return val.toString().includes(',') ? `"${val.toString().replace(/"/g, '""')}"` : val;
+        }).join(',');
+      });
+
+      // New items mapped to their columns
+      const newRows = newItems.map(item => {
+        return columns.map((col, i) => {
+          let val = '';
+          if (i === taskColumnIndex) val = item.action || '';
+          else if (i === ownerColumnIndex) val = item.owner || 'Unassigned';
+          else if (i === statusColumnIndex) val = item.status || 'Not Started';
+          else if (i === dateColumnIndex) val = item.deadline || '';
+          else if (i === deliverableColumnIndex) val = item.deliverable || '';
+          else if (i === priorityColumnIndex) val = item.priority || 'Medium';
+          return val.includes(',') ? `"${val.replace(/"/g, '""')}"` : val;
+        }).join(',');
+      });
+
+      // 5 empty rows at the bottom
+      const emptyRow = columns.map(() => '').join(',');
+      const emptyRows = Array(5).fill(emptyRow);
+
+      csv = [headerRow, ...existingRows, ...newRows, ...emptyRows].join('\n');
+
+    } else {
+      // ── Option A: FollowThru standard columns ──
+      const standardCols = ['Task', 'Owner', 'Status', 'End Date', 'Milestone', 'Deliverable', 'Notes', 'Priority'];
+
+      // Convert existing rows to standard format using detected column indices
+      const existingStandard = (rows || []).map(row => {
+        const task = taskColumnIndex >= 0 ? (row[taskColumnIndex] || '') : '';
+        const owner = ownerColumnIndex >= 0 ? (row[ownerColumnIndex] || '') : '';
+        const status = statusColumnIndex >= 0 ? (row[statusColumnIndex] || '') : '';
+        const date = dateColumnIndex >= 0 ? (row[dateColumnIndex] || '') : '';
+        const deliverable = deliverableColumnIndex >= 0 ? (row[deliverableColumnIndex] || '') : '';
+        const priority = priorityColumnIndex >= 0 ? (row[priorityColumnIndex] || '') : '';
+        return [
+          task.includes(',') ? `"${task.replace(/"/g,'""')}"` : task,
+          owner, status, date, '', deliverable, '', priority
+        ].join(',');
+      });
+
+      // New items in standard format
+      const newStandard = newItems.map(item => {
+        const task = `"${(item.action || '').replace(/"/g, '""')}"`;
+        return [task, item.owner||'Unassigned', item.status||'Not Started', item.deadline||'', '', item.deliverable||'', '', item.priority||'Medium'].join(',');
+      });
+
+      // 5 empty rows
+      const emptyRows = Array(5).fill(standardCols.map(() => '').join(','));
+
+      csv = [standardCols.join(','), ...existingStandard, ...newStandard, ...emptyRows].join('\n');
     }
-
-    // Map our data fields to their column names
-    const fieldMap = {
-      [trackerSchema.taskColumn]: (it) => it.action || '',
-      [trackerSchema.ownerColumn]: (it) => it.owner || 'Unassigned',
-      [trackerSchema.statusColumn]: (it) => it.status || 'Not Started',
-      [trackerSchema.dateColumn]: (it) => it.deadline || '',
-      [trackerSchema.deliverableColumn]: (it) => it.deliverable || '',
-      [trackerSchema.priorityColumn]: (it) => it.priority || 'Medium'
-    };
-
-    // Build CSV rows using their column order
-    const headerRow = columns.join(',');
-    const dataRows = items.map(it => {
-      return columns.map(col => {
-        const getter = fieldMap[col];
-        const value = getter ? getter(it) : '';
-        // Wrap in quotes if contains comma
-        return value.includes(',') ? `"${value.replace(/"/g, '""')}"` : value;
-      }).join(',');
-    });
-
-    const csv = [headerRow, ...dataRows].join('\n');
 
     res.json({
       csv,
       columns,
-      detectedMapping: {
-        task: trackerSchema.taskColumn,
-        owner: trackerSchema.ownerColumn,
-        status: trackerSchema.statusColumn,
-        date: trackerSchema.dateColumn,
-        deliverable: trackerSchema.deliverableColumn,
-        priority: trackerSchema.priorityColumn
-      }
+      existingCount: (rows || []).length,
+      newCount: newItems.length
     });
 
   } catch (err) {
-    console.error('Match tracker error:', err);
+    console.error('Combine tracker error:', err);
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // ─── Start Server ──────────────────────────────────────────
 app.listen(PORT, () => {

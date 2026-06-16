@@ -9,7 +9,6 @@ app.use(cors({
   origin: 'https://follow-thru.netlify.app',
   credentials: true
 }));
-
 app.use(express.json({ limit: '10mb' }));
 
 app.get('/', (req, res) => {
@@ -24,18 +23,19 @@ app.post('/extract', async (req, res) => {
   }
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
+        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`
       },
       body: JSON.stringify({
-        model: 'claude-opus-4-5',
+        model: 'llama-3.3-70b-versatile',
         max_tokens: 2000,
-        system: `You are a precise meeting notes parser. Extract every single action item from meeting notes without missing any or merging any together.
-
+        messages: [
+          {
+            role: 'system',
+            content: `You are a precise meeting notes parser. Extract every single action item from meeting notes without missing any or merging any together.
 STRICT RULES:
 1. Extract EVERY action item. If in doubt include it.
 2. NEVER merge two separate tasks into one item.
@@ -45,7 +45,6 @@ STRICT RULES:
 6. DEADLINE: Extract exact date or timeframe. If none use null.
 7. PRIORITY: urgent/ASAP/critical = High. Default = Medium. when you get a chance = Low.
 8. Return ONLY valid JSON. No markdown. Nothing else.
-
 Format:
 {
   "items": [
@@ -57,8 +56,8 @@ Format:
       "priority": "High|Medium|Low"
     }
   ]
-}`,
-        messages: [
+}`
+          },
           {
             role: 'user',
             content: `Extract every action item. Do not miss any. Do not merge any.\n\n${notes}`
@@ -70,13 +69,12 @@ Format:
     const data = await response.json();
     if (data.error) return res.status(500).json({ error: data.error.message });
 
-    const raw = data.content?.[0]?.text || '{}';
+    const raw = data.choices[0].message.content || '{}';
     const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
     const items = (parsed.items || []).map((item, i) => ({ ...item, id: String(i + 1) }));
 
     console.log(`Extracted ${items.length} items`);
     res.json({ items });
-
   } catch (err) {
     console.error('Extract error:', err);
     res.status(500).json({ error: err.message });
